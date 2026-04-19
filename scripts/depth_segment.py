@@ -96,15 +96,12 @@ def segment_layers(image_path, depth_array, output_dir, num_layers=3):
 
     # 创建图层
     results = {}
-    prev_threshold = 0.0
+    all_thresholds = [0.0] + thresholds + [1.01]  # 添加边界
 
-    for i, (threshold, name) in enumerate(zip(thresholds, layer_names)):
-        if i < len(thresholds) - 1:
-            # 中间层
-            mask = (depth_array >= prev_threshold) & (depth_array < threshold)
-        else:
-            # 最后一层（包含边界）
-            mask = depth_array >= prev_threshold
+    for i, name in enumerate(layer_names):
+        low = all_thresholds[i]
+        high = all_thresholds[i + 1]
+        mask = (depth_array >= low) & (depth_array < high)
 
         # 边缘羽化
         mask_float = mask.astype(np.float64)
@@ -121,8 +118,6 @@ def segment_layers(image_path, depth_array, output_dir, num_layers=3):
         Image.fromarray(layer).save(out_path)
         results[name] = out_path
         print(f"  ✅ {name}: {out_path}")
-
-        prev_threshold = threshold
 
     # 保存深度图
     depth_vis = (depth_array * 255).astype(np.uint8)

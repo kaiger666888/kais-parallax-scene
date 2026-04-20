@@ -148,27 +148,53 @@ def composite_parallax(bg_path, fg_path, output_path, duration=3.0, fps=24,
 
 # ─── 主管线 ──────────────────────────────────────
 
+def _upload_for_ref(local_path):
+    """上传图片到临时HTTP服务，返回URL供即梦图生图使用。
+    
+    如果图片已是URL则直接返回。
+    如果本地有jimeng-free-api容器，使用其代理能力。
+    否则使用base64 data URI。
+    """
+    if local_path.startswith("http"):
+        return local_path
+    # 即梦API支持base64 data URI
+    import base64
+    mime = "image/png" if local_path.endswith(".png") else "image/jpeg"
+    with open(local_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:{mime};base64,{b64}"
+
+
 def run_pipeline(prompt, output_path, session_id,
                  model="jimeng-5.0", bg_ratio="21:9", fg_ratio="16:9",
                  resolution="2k", duration=3.0, fps=24,
                  jimeng_base_url="http://localhost:8000",
-                 work_dir="/tmp/jimeng_parallax"):
+                 work_dir="/tmp/jimeng_parallax",
+                 source_image=None):
     """三步AI视差管线"""
     os.makedirs(work_dir, exist_ok=True)
 
     api = JimengAPI(jimeng_base_url, session_id)
 
-    # ── 步骤1: 文生图 ──
-    print("🎨 步骤1: 文生图...")
-    step1 = api.generate_image(prompt, model=model, ratio="16:9", resolution=resolution)
-    if not step1:
-        raise RuntimeError("文生图失败")
-    orig_url = step1[0]["url"]
-    orig_path = f"{work_dir}/step1_original.png"
-    api.download(orig_url, orig_path)
-    print(f"   ✅ 原始场景: {orig_path}")
-
-    time.sleep(1.5)  # QPS安全
+    # ── 步骤1: 获取原始场景图（用户图 or 文生图） ──
+    if source_image and os.path.exists(source_image):
+        print("📷 步骤1: 使用用户提供的原始图...")
+        orig_path = f"{work_dir}/step1_original.png"
+        # 复制到工作目录
+        Image.open(source_image).save(orig_path)
+        # 上传到可访问的URL（即梦图生图需要URL）
+        orig_url = _upload_for_ref(orig_path)
+        print(f"   ✅ 用户图: {source_image}")
+    else:
+        print("🎨 步骤1: 文生图...")
+        step1 = api.generate_image(prompt, model=model, ratio="16:9", resolution=resolution)
+        if not step1:
+            raise RuntimeError("文生图失败")
+        orig_url = step1[0]["url"]
+        orig_path = f"{work_dir}/step1_original.png"
+        api.download(orig_url, orig_path)
+        print(f"   ✅ 原始场景: {orig_path}")
+        time.sleep(1.5)  # QPS安全
 
     # ── 步骤2a: 图生图 - 超宽背景 ──
     print("🖼️  步骤2a: 图生图 - 超宽背景...")
@@ -227,7 +253,8 @@ def run_pipeline(prompt, output_path, session_id,
 
 def main():
     parser = argparse.ArgumentParser(description="AI视差场景生成管线（三步法）")
-    parser.add_argument("--prompt", required=True, help="场景描述")
+    parser.add_argument("--prompt", required=False, help="场景描述（有--source-image时可选）")
+    parser.add_argument("--source-image", default=None, help="用户提供的原始图路径（跳过文生图）")
     parser.add_argument("-o", "--output", default="output.mp4", help="输出MP4路径")
     parser.add_argument("--session-id", default="", help="即梦session ID（或设JIMENG_SESSION_ID环境变量）")
     parser.add_argument("--model", default="jimeng-5.0", help="即梦模型")
@@ -242,7 +269,6 @@ def main():
 
     session_id = args.session_id or os.environ.get("JIMENG_SESSION_ID", "")
     if not session_id:
-        # 尝试从docker容器获取
         try:
             result = subprocess.run(
                 "docker exec jimeng-free-api printenv JIMENG_SESSION_ID",
@@ -255,8 +281,12 @@ def main():
         print("❌ 需要即梦session ID: --session-id 或 JIMENG_SESSION_ID 环境变量")
         sys.exit(1)
 
+    if not args.prompt and not args.source_image:
+        print("❌ 需要 --prompt 或 --source-image")
+        sys.exit(1)
+
     run_pipeline(
-        prompt=args.prompt,
+        prompt=args.prompt or "",
         output_path=args.output,
         session_id=session_id,
         model=args.model,
@@ -267,6 +297,7 @@ def main():
         fps=args.fps,
         jimeng_base_url=args.jimeng_url,
         work_dir=args.work_dir,
+        source_image=args.source_image,
     )
 
 

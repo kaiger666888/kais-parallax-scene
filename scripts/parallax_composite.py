@@ -126,9 +126,12 @@ def kenburns_composite(layers, output_dir, frames, zoom=1.2, pan_range=80, sourc
     for i in range(frames):
         t = i / max(1, frames - 1)  # 0~1
 
+        # 讲故事效果：极缓的线性移动，不用缓动曲线
+        # 让观众几乎感觉不到画面在动，但潜意识有动感
+
         # 缩放：始终放大，保证无黑边
-        zoom_start = zoom * 0.85
-        zoom_end = zoom * 1.15
+        zoom_start = zoom * 0.92
+        zoom_end = zoom * 1.08
         scale = zoom_start + (zoom_end - zoom_start) * t
         new_w = int(w * scale)
         new_h = int(h * scale)
@@ -173,8 +176,8 @@ def main():
     parser.add_argument("--duration", type=float, default=3.0)
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--parallax-strength", type=int, default=200, help="视差偏移强度(px)")
-    parser.add_argument("--kenburns-zoom", type=float, default=1.15, help="Ken Burns缩放倍率")
-    parser.add_argument("--kenburns-pan", type=int, default=80, help="Ken Burns平移范围(px)")
+    parser.add_argument("--kenburns-zoom", type=float, default=1.1, help="Ken Burns缩放倍率（1.05=微动, 1.3=明显）")
+    parser.add_argument("--kenburns-pan", type=int, default=30, help="Ken Burns平移范围(px, 越小越微动)")
     parser.add_argument("--source", default=None, help="Ken Burns用完整原图路径（推荐）")
     parser.add_argument("--depth-threshold", type=float, default=0.12, help="自动模式景深方差阈值")
     parser.add_argument("--width", type=int, default=None)

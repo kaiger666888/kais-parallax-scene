@@ -1,26 +1,33 @@
 ---
 name: kais-parallax-scene
-version: 0.4.0
-description: "2.5D视差场景生成器。将即梦/SD超宽图通过Windows GPU自动分层，复用kais-blender-engine远程构建视差场景并渲染动态镜头视频。全流程单机Windows执行，无需跨机器传输。触发词：视差场景, parallax, 2.5D场景, 宽图分层, parallax scene, 视差动画, 景深分层, 场景分层, 即梦宽图, 超宽图分层, parallax animation, 视差生成"
+version: 0.5.0
+description: "AI视差场景生成器。两种模式：(1)AI三步法：即梦文生图→图生图分层→视差合成；(2)深度分层法：MiDaS GPU分层→Blender渲染。触发词：视差场景, parallax, 2.5D场景, AI视差, parallax scene, 视差动画, 景深分层, 场景分层, 即梦宽图, parallax animation, 视差生成"
 ---
 
-# kais-parallax-scene — 2.5D 视差场景生成器
+# kais-parallax-scene — AI视差场景生成器
 
-> 将即梦/SD超宽图（21:9 / 32:9）自动分层为前景/中景/背景，
-> 通过 **kais-blender-engine** 在 Windows GPU 端完成视差场景构建和渲染。
+> **两种管线模式**：
 >
-> **全流程单机执行**：分层（MiDaS GPU）+ 渲染（Blender GPU），无需跨机器传输。
+> | 模式 | 流程 | 适用场景 | 质量 |
+> |------|------|----------|------|
+> | **AI三步法** ⭐ | 即梦文生图 → 图生图(背景+前景) → rembg抠图 → 视差合成 | 任意场景，无分割重影 | ⭐⭐⭐⭐⭐ |
+> | 深度分层法 | MiDaS GPU分层 → Blender渲染 | 有明确景深的场景 | ⭐⭐⭐ |
+>
+> **推荐AI三步法**：AI生成独立的背景和前景图，彻底避免分割重影和黑块问题。
 
 ## 前置依赖
 
 <!-- FREEDOM:low -->
 
+### AI三步法（推荐）
+- **jimeng-free-api** Docker 容器运行中（Linux 端 `localhost:8000`）
+- **即梦 session ID**（环境变量 `JIMENG_SESSION_ID` 或 Docker 容器内获取）
+- **rembg** — Python 背景移除（`pip install rembg`）
+- **numpy** + **Pillow** + **ffmpeg**
+
+### 深度分层法
 - **kais-blender-engine** skill 已安装，Windows 端 Blender Agent Server 运行中
-- **Windows 端 Python 依赖**（已安装）：
-  - `torch` 2.7+ (CUDA)
-  - `transformers` (MiDaS DPT-Large)
-  - `scipy` + `Pillow`
-- **Linux 端**仅需 `requests` + `pydantic`（调用 engine API）
+- **Windows 端 Python 依赖**：`torch` 2.7+ (CUDA), `transformers`, `scipy`, `Pillow`
 
 ## 管线位置
 
@@ -46,7 +53,79 @@ description: "2.5D视差场景生成器。将即梦/SD超宽图通过Windows GPU
 
 ---
 
-## 全流程（两步，全Windows端）
+## ⭐ AI三步法管线（推荐）
+
+```
+即梦文生图 ──→ 即梦图生图(背景21:9) ──→ 即梦图生图(前景16:9) ──→ rembg抠图 ──→ 视差合成 ──→ MP4
+     ①                    ②a                      ②b                   ③a            ③b
+```
+
+**核心思路**：AI生成独立的背景和前景图，不依赖分割，彻底避免重影和黑块。
+
+### 一键执行
+
+```bash
+# 基础用法
+python3 scripts/ai_parallax_pipeline.py \
+  --prompt "A cozy coffee shop interior, warm lighting, wooden tables, photorealistic" \
+  -o output.mp4
+
+# 完整参数
+python3 scripts/ai_parallax_pipeline.py \
+  --prompt "咖啡店内部，暖色调，木桌" \
+  -o coffee_parallax.mp4 \
+  --bg-ratio 21:9 \
+  --duration 4.0 \
+  --fps 24 \
+  --work-dir /tmp/jimeng_parallax
+```
+
+### 步骤详解
+
+| 步骤 | 操作 | 即梦API | 输出 |
+|------|------|---------|------|
+| ① 文生图 | 场景描述→原始图 | `generateImage()` | `step1_original.png` (16:9) |
+| ②a 图生图(背景) | 参考原始图→纯背景 | `generateImage(images=[url])` | `step2_background.png` (21:9超宽) |
+| ②b 图生图(前景) | 参考原始图→前景 | `generateImage(images=[url])` | `step3_foreground_raw.png` (16:9) |
+| ③a rembg抠图 | 去除前景白底 | 本地rembg | `step3_foreground_clean.png` |
+| ③b 视差合成 | 背景+前景→MP4 | 本地Python+ffmpeg | `output.mp4` |
+
+### 参数说明
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--prompt` | 必填 | 场景描述（英文效果更好） |
+| `--bg-ratio` | 21:9 | 背景图比例（21:9提供更大平移空间） |
+| `--fg-ratio` | 16:9 | 前景图比例 |
+| `--duration` | 3.0 | 视频时长(秒) |
+| `--fps` | 24 | 帧率 |
+| `--resolution` | 2k | 即梦生图分辨率 |
+| `--session-id` | 自动 | 即梦session（默认从Docker容器获取） |
+
+### 合成原理
+
+```
+每帧：
+1. 背景层（超宽21:9）→ Ken Burns微动裁剪 → canvas
+2. 前景层（rembg抠图）→ 更大偏移 → alpha叠加到canvas
+3. 前景动得多 + 背景动得少 = 自然景深
+```
+
+- 背景是AI生成的完整图（无黑块）
+- 前景是AI生成的独立图（无重影）
+- 两层各自预放大一次再裁剪（无顿挫）
+- alpha叠加（前景边缘自然融合）
+
+### Prompt 技巧
+
+- **英文**效果比中文好（即梦训练数据偏向英文）
+- 背景prompt加 `background only, no people no furniture, empty interior`
+- 前景prompt加 `foreground subjects only, isolated on white background, cutout style`
+- 通用后缀加 `photorealistic, 8k, cinematic lighting`
+
+---
+
+## 深度分层法（传统）
 
 ```
 步骤一：GPU深度分层              步骤二：GPU视差渲染
@@ -237,9 +316,10 @@ python parallax_composite.py --image-dir <dir> --output out.mp4
 kais-parallax-scene/
 ├── SKILL.md                          # 本文件
 ├── scripts/
+│   ├── ai_parallax_pipeline.py       # ⭐ AI三步法管线（推荐）
 │   ├── depth_segment_win.py          # Windows端深度分层脚本（GPU）
-│   ├── parallax_composite.py         # 双模式合成引擎（核心）
-│   └── parallax_pipeline.py          # 全流程编排
+│   ├── parallax_composite.py         # 双模式合成引擎
+│   └── parallax_pipeline.py          # 深度分层全流程编排
 └── references/
     ├── parallax-math.md              # 视差数学原理
     └── midas-setup.md                # MiDaS安装指南

@@ -1,6 +1,6 @@
 ---
 name: kais-parallax-scene
-version: 0.3.0
+version: 0.4.0
 description: "2.5D视差场景生成器。将即梦/SD超宽图通过Windows GPU自动分层，复用kais-blender-engine远程构建视差场景并渲染动态镜头视频。全流程单机Windows执行，无需跨机器传输。触发词：视差场景, parallax, 2.5D场景, 宽图分层, parallax scene, 视差动画, 景深分层, 场景分层, 即梦宽图, 超宽图分层, parallax animation, 视差生成"
 ---
 
@@ -194,6 +194,43 @@ python3 scripts/parallax_pipeline.py \
 
 ---
 
+## 双模式自动选择
+
+<!-- FREEDOM:low -->
+
+合成引擎根据**深度图方差**自动选择最佳模式：
+
+| 模式 | 条件 | 效果 | 适用场景 |
+|------|------|------|----------|
+| **视差偏移** | `depth_variance > 0.12` | 各层按深度不同偏移 | 风景、户外、有纵深感 |
+| **Ken Burns** | `depth_variance ≤ 0.12` | 缓慢缩放+平移 | 室内、平坦、浅景深 |
+
+### 视差模式参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--parallax-strength` | 200 | 前景最大偏移(px) |
+
+### Ken Burns模式参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--kenburns-zoom` | 1.15 | 缩放倍率（1.0=不缩放） |
+| `--kenburns-pan` | 100 | 平移范围(px) |
+
+### 强制指定模式
+
+```bash
+# 强制视差
+python parallax_composite.py --image-dir <dir> --mode parallax --output out.mp4
+# 强制Ken Burns
+python parallax_composite.py --image-dir <dir> --mode kenburns --output out.mp4
+# 自动选择（默认）
+python parallax_composite.py --image-dir <dir> --output out.mp4
+```
+
+---
+
 ## 文件结构
 
 ```
@@ -201,11 +238,9 @@ kais-parallax-scene/
 ├── SKILL.md                          # 本文件
 ├── scripts/
 │   ├── depth_segment_win.py          # Windows端深度分层脚本（GPU）
+│   ├── parallax_composite.py         # 双模式合成引擎（核心）
 │   └── parallax_pipeline.py          # 全流程编排
 └── references/
     ├── parallax-math.md              # 视差数学原理
     └── midas-setup.md                # MiDaS安装指南
-
-# 渲染能力由 kais-blender-engine 提供：
-kais-blender-engine/client/generators/parallax.py  # ParallaxParams + generate_parallax_script()
 ```

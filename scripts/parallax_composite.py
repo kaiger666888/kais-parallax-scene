@@ -109,40 +109,47 @@ def parallax_composite(layers, output_dir, frames, parallax_strength=200):
         Image.fromarray(canvas).save(f"{output_dir}/{i + 1:04d}.png")
 
 
-def kenburns_composite(layers, output_dir, frames, zoom=1.15, pan_range=100):
-    """Ken Burns模式：缓慢缩放+平移，单张图效果"""
-    # 用中景（或最大层）作为源图
-    source = layers.get("midground")
-    if source is None:
-        source = max(layers.values(), key=lambda l: (l[:, :, 3] > 128).sum())
+def kenburns_composite(layers, output_dir, frames, zoom=1.2, pan_range=80, source_path=None):
+    """Ken Burns模式：始终在图片内部缩放+平移，无黑边
+    
+    优先使用完整原图（如果有），否则用最大分层图
+    """
+    if source_path and os.path.exists(source_path):
+        source = np.array(Image.open(source_path).convert("RGBA"))
+    else:
+        source = layers.get("midground")
+        if source is None:
+            source = max(layers.values(), key=lambda l: (l[:, :, 3] > 128).sum())
 
     h, w = source.shape[:2]
-    output_w, output_h = w, h
 
     for i in range(frames):
         t = i / max(1, frames - 1)  # 0~1
 
-        # 缩放：从1.0到zoom
-        scale = 1.0 + (zoom - 1.0) * t
+        # 缩放：始终放大，保证无黑边
+        zoom_start = zoom * 0.85
+        zoom_end = zoom * 1.15
+        scale = zoom_start + (zoom_end - zoom_start) * t
         new_w = int(w * scale)
         new_h = int(h * scale)
 
-        # 先放大
         scaled = np.array(Image.fromarray(source).resize((new_w, new_h), Image.LANCZOS))
 
-        # 平移（从一侧缓慢移到另一侧）
-        pan = int(pan_range * (t - 0.5))
-        x1 = max(0, pan)
-        x2 = min(output_w, pan + output_w)
+        # 裁剪中心区域（始终在放大图内部）
+        max_pan_x = (new_w - w) // 2
+        pan = int(max_pan_x * (t - 0.5) * 0.8)
 
-        canvas = np.zeros((output_h, output_w, 4), dtype=np.uint8)
-        if x2 > x1:
-            cw = min(x2, new_w) - x1
-            ch = min(output_h, new_h)
-            if cw > 0 and ch > 0:
-                canvas[:ch, x1:x1 + cw] = scaled[:ch, :cw]
+        cx = new_w // 2 + pan
+        x1 = max(0, min(cx - w // 2, new_w - w))
+        x2 = max(w, min(cx + w // 2, new_w))
+        y1 = max(0, min(new_h // 2 - h // 2, new_h - h))
+        y2 = max(h, min(new_h // 2 + h // 2, new_h))
 
-        Image.fromarray(canvas).save(f"{output_dir}/{i + 1:04d}.png")
+        frame = scaled[y1:y2, x1:x2].copy()
+        if frame.shape[0] != h or frame.shape[1] != w:
+            frame = np.array(Image.fromarray(frame).resize((w, h), Image.LANCZOS))
+
+        Image.fromarray(frame).save(f"{output_dir}/{i + 1:04d}.png")
 
 
 def frames_to_video(output_dir, video_path, fps=24, width=None, height=None):
@@ -167,7 +174,8 @@ def main():
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--parallax-strength", type=int, default=200, help="视差偏移强度(px)")
     parser.add_argument("--kenburns-zoom", type=float, default=1.15, help="Ken Burns缩放倍率")
-    parser.add_argument("--kenburns-pan", type=int, default=100, help="Ken Burns平移范围(px)")
+    parser.add_argument("--kenburns-pan", type=int, default=80, help="Ken Burns平移范围(px)")
+    parser.add_argument("--source", default=None, help="Ken Burns用完整原图路径（推荐）")
     parser.add_argument("--depth-threshold", type=float, default=0.12, help="自动模式景深方差阈值")
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
@@ -196,7 +204,7 @@ def main():
     if args.mode == "parallax":
         parallax_composite(layers, frames_dir, frames, args.parallax_strength)
     else:
-        kenburns_composite(layers, frames_dir, frames, args.kenburns_zoom, args.kenburns_pan)
+        kenburns_composite(layers, frames_dir, frames, args.kenburns_zoom, args.kenburns_pan, source_path=args.source)
 
     # 合成视频
     video_path = frames_to_video(frames_dir, args.output, args.fps, args.width, args.height)

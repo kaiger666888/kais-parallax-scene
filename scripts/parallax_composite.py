@@ -41,7 +41,7 @@ def load_layers(image_dir):
 def calc_depth_variance(depth):
     """计算深度图方差（0=平坦, 1=景深丰富）"""
     if depth is None:
-        return 0.5  # 未知则默认中等
+        return 0.5
     return float(np.std(depth))
 
 
@@ -78,14 +78,77 @@ def alpha_composite(canvas, overlay, shift_x=0, shift_y=0):
     return canvas
 
 
-def parallax_composite(layers, output_dir, frames, parallax_strength=200):
-    """视差模式：各层按深度不同偏移"""
+def _build_base_image(layers, h, w):
+    """用所有层合成一张完整底图（无偏移），确保无透明空洞。"""
+    base = np.zeros((h, w, 4), dtype=np.uint8)
+    # 从远到近叠加，近处覆盖远处
+    for name in ["distant", "background", "midground", "foreground"]:
+        layer = layers.get(name)
+        if layer is not None:
+            lh, lw = layer.shape[:2]
+            # 裁剪或居中放置到目标尺寸
+            y1 = max(0, (h - lh) // 2)
+            x1 = max(0, (w - lw) // 2)
+            sy1 = max(0, (lh - h) // 2)
+            sx1 = max(0, (lw - w) // 2)
+            rh = min(lh - sy1, h - y1)
+            rw = min(lw - sx1, w - x1)
+            region = layer[sy1:sy1+rh, sx1:sx1+rw]
+            base = alpha_composite(base, region, shift_x=x1 - sx1, shift_y=y1 - sy1)
+    return base
+
+
+def _extend_layer(layer, margin):
+    """边缘镜像扩展，防止偏移后露出底图。
+
+    对图层四边进行镜像填充 margin 像素，生成扩展后的图层。
+    """
+    if margin <= 0:
+        return layer
+    from PIL import Image as PILImage
+    img = PILImage.fromarray(layer)
+    # PAD 模式用 edge（边缘色填充），比 mirror 更自然
+    extended = np.array(
+        PILImageOps_expand(img, border=margin, fill=(0, 0, 0, 0))
+    ) if False else _manual_extend(layer, margin)
+    return extended
+
+
+def _manual_extend(layer, margin):
+    """手动边缘扩展：镜像填充。"""
+    h, w = layer.shape[:2]
+    new_h = h + 2 * margin
+    new_w = w + 2 * margin
+    extended = np.zeros((new_h, new_w, 4), dtype=np.uint8)
+    # 中心放原图
+    extended[margin:margin+h, margin:margin+w] = layer
+    # 四边镜像
+    # 左
+    if margin > 0 and w >= margin:
+        extended[margin:margin+h, :margin] = layer[:, margin-1::-1][:, :margin]
+    # 右
+    if margin > 0 and w >= margin:
+        extended[margin:margin+h, margin+w:] = layer[:, :-(margin+1):-1][:, :margin]
+    # 上
+    if margin > 0 and h >= margin:
+        extended[:margin, margin:margin+w] = layer[margin-1::-1, :][:margin]
+    # 下
+    if margin > 0 and h >= margin:
+        extended[margin+h:, margin:margin+w] = layer[:-(margin+1):-1, :][:margin]
+    return extended
+
+
+def parallax_composite(layers, output_dir, frames, parallax_strength=200,
+                       source_path=None):
+    """视差模式：各层按深度不同偏移，用完整底图填充空洞。"""
     midground = layers.get("midground")
     if midground is None:
-        # 用最大的层作为基准
         midground = max(layers.values(), key=lambda l: (l[:, :, 3] > 128).sum())
 
     h, w = midground.shape[:2]
+
+    # 构建完整底图（所有层零偏移合成，保证无空洞）
+    base = _build_base_image(layers, h, w)
 
     # 各层偏移量（近→远递减）
     shift_map = {
@@ -97,21 +160,22 @@ def parallax_composite(layers, output_dir, frames, parallax_strength=200):
 
     for i in range(frames):
         t = (i / max(1, frames - 1)) - 0.5  # -0.5 ~ 0.5
-        canvas = midground.copy()
+        canvas = base.copy()
 
         for name in ["distant", "background", "foreground"]:
-            layer = layers.get(name)
-            if layer is None:
+            if name not in layers:
                 continue
             shift = int(t * shift_map[name])
-            canvas = alpha_composite(canvas, layer, shift_x=shift)
+            canvas = alpha_composite(canvas, layers[name], shift_x=shift)
 
-        Image.fromarray(canvas).save(f"{output_dir}/{i + 1:04d}.png")
+        # 转为 RGB（丢弃 alpha，底图已保证无空洞）
+        rgb = canvas[:, :, :3].copy()
+        Image.fromarray(rgb).save(f"{output_dir}/{i + 1:04d}.png")
 
 
 def kenburns_composite(layers, output_dir, frames, zoom=1.2, pan_range=80, source_path=None):
     """Ken Burns模式：始终在图片内部缩放+平移，无黑边
-    
+
     优先使用完整原图（如果有），否则用最大分层图
     """
     if source_path and os.path.exists(source_path):
@@ -126,10 +190,6 @@ def kenburns_composite(layers, output_dir, frames, zoom=1.2, pan_range=80, sourc
     for i in range(frames):
         t = i / max(1, frames - 1)  # 0~1
 
-        # 讲故事效果：极缓的线性移动，不用缓动曲线
-        # 让观众几乎感觉不到画面在动，但潜意识有动感
-
-        # 缩放：始终放大，保证无黑边
         zoom_start = zoom * 0.92
         zoom_end = zoom * 1.08
         scale = zoom_start + (zoom_end - zoom_start) * t
@@ -138,7 +198,6 @@ def kenburns_composite(layers, output_dir, frames, zoom=1.2, pan_range=80, sourc
 
         scaled = np.array(Image.fromarray(source).resize((new_w, new_h), Image.LANCZOS))
 
-        # 裁剪中心区域（始终在放大图内部）
         max_pan_x = (new_w - w) // 2
         pan = int(max_pan_x * (t - 0.5) * 0.8)
 
@@ -176,8 +235,8 @@ def main():
     parser.add_argument("--duration", type=float, default=3.0)
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--parallax-strength", type=int, default=200, help="视差偏移强度(px)")
-    parser.add_argument("--kenburns-zoom", type=float, default=1.1, help="Ken Burns缩放倍率（1.05=微动, 1.3=明显）")
-    parser.add_argument("--kenburns-pan", type=int, default=30, help="Ken Burns平移范围(px, 越小越微动)")
+    parser.add_argument("--kenburns-zoom", type=float, default=1.1, help="Ken Burns缩放倍率")
+    parser.add_argument("--kenburns-pan", type=int, default=30, help="Ken Burns平移范围(px)")
     parser.add_argument("--source", default=None, help="Ken Burns用完整原图路径（推荐）")
     parser.add_argument("--depth-threshold", type=float, default=0.12, help="自动模式景深方差阈值")
     parser.add_argument("--width", type=int, default=None)
@@ -191,28 +250,27 @@ def main():
 
     frames = int(args.duration * args.fps)
 
-    # 自动模式：根据景深方差选择
     if args.mode == "auto":
         variance = calc_depth_variance(depth)
         if variance > args.depth_threshold:
             args.mode = "parallax"
         else:
             args.mode = "kenburns"
-        print(f"📊 景深方差={variance:.3f} (阈值={args.depth_threshold}) → {args.mode}模式")
+        print(f"Depth variance={variance:.3f} (threshold={args.depth_threshold}) -> {args.mode} mode")
 
-    # 临时帧目录
     frames_dir = args.output.rsplit(".", 1)[0] + "_frames"
     os.makedirs(frames_dir, exist_ok=True)
 
     if args.mode == "parallax":
-        parallax_composite(layers, frames_dir, frames, args.parallax_strength)
+        parallax_composite(layers, frames_dir, frames, args.parallax_strength,
+                           source_path=args.source)
     else:
-        kenburns_composite(layers, frames_dir, frames, args.kenburns_zoom, args.kenburns_pan, source_path=args.source)
+        kenburns_composite(layers, frames_dir, frames, args.kenburns_zoom, args.kenburns_pan,
+                           source_path=args.source)
 
-    # 合成视频
     video_path = frames_to_video(frames_dir, args.output, args.fps, args.width, args.height)
     size = os.path.getsize(video_path)
-    print(f"✅ {args.mode}模式: {video_path} ({size}B, {args.duration}s, {frames}frames)")
+    print(f"{args.mode} mode: {video_path} ({size}B, {args.duration}s, {frames}frames)")
 
     return video_path
 

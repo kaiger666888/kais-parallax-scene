@@ -1,145 +1,159 @@
 #!/usr/bin/env python3
 """
-视差场景全流程编排 — 全部在Windows端执行
+视差场景全流程编排 — 本地 GPU 执行
+
+流程：
+  步骤1: MiDaS 深度分层 (本地 GPU)
+  步骤2: 视差/Ken Burns 合成 (本地 CPU/GPU)
 
 用法:
-  python3 parallax_pipeline.py --image-path "D:/path/to/wide.png" --execute-remote
-  
-  或通过engine API直接调用（推荐）
+  python3 parallax_pipeline.py --image-path ./wide.png --name scene_001
+  python3 parallax_pipeline.py --image-path ./wide.png --camera scroll_left --duration 6.0
 """
 
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ENGINE_CLIENT_DIR = os.path.expanduser("~/.openclaw/workspace/skills/kais-blender-engine/client")
-ENGINE_HOST = "http://192.168.71.38:8080"
-
-# depth_segment_win.py 在Windows端的路径
-WIN_SEGMENT_SCRIPT = "C:/Users/Kai/depth_segment_win.py"
-
-# 默认输出目录
-WIN_OUTPUT_DIR = "D:/BlenderAgent/cache/parallax"
+DEFAULT_OUTPUT_DIR = "/tmp/kais-parallax"
 
 
-def run_remote_segment(image_path, output_dir, layers=3):
-    """在Windows端运行MiDaS深度估计+分层"""
-    sys.path.insert(0, ENGINE_CLIENT_DIR)
-    from blender_client import BlenderAgentClient
-
-    cli = BlenderAgentClient(ENGINE_HOST)
-    
-    # 读取本地脚本内容，通过engine远程执行
-    script_path = os.path.join(SCRIPT_DIR, "depth_segment_win.py")
-    with open(script_path) as f:
-        segment_script = f.read()
-
-    # 构建执行命令
-    cmd = f"""
-import sys
-sys.argv = ["depth_segment_win.py", "{image_path}", "-o", "{output_dir}", "-l", "{layers}"]
-{segment_script}
-"""
-    print(f"🔍 Running depth segmentation on Windows (GPU)...")
-    job_id = cli.run_async(cmd, timeout=300)
-    status = cli.poll_job(job_id, interval=10, max_wait=300)
-    
-    if status.get("status") != "completed":
-        print(f"❌ Segmentation failed: {status}")
+def run_local_segment(image_path, output_dir, layers=3, sigma=3.0):
+    """本地运行 MiDaS 深度估计 + 分层。"""
+    cmd = [
+        sys.executable,
+        os.path.join(SCRIPT_DIR, "depth_segment.py"),
+        image_path,
+        "-o", output_dir,
+        "-l", str(layers),
+        "--sigma", str(sigma),
+    ]
+    print(f"Running depth segmentation locally...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Segmentation failed:\n{result.stderr}")
         return None
-    
-    # 读取生成的layers.json
-    result = cli.run_sync(f"""
-import json
-path = "{output_dir}/layers.json".replace("/", os.sep)
-with open(path) as f:
-    print(json.dumps(json.load(f)))
-""", timeout=30)
-    
-    stdout = result.get("stdout", "")
-    # 找到最后一行有效JSON
-    for line in reversed(stdout.strip().split("\n")):
-        line = line.strip()
-        if line.startswith("["):
-            return json.loads(line)
-    
-    print("❌ Failed to read layers.json")
+    print(result.stdout)
+
+    # 读取 layers.json
+    json_path = os.path.join(output_dir, "layers.json")
+    if not os.path.exists(json_path):
+        print(f"ERROR: layers.json not found at {json_path}")
+        return None
+
+    with open(json_path) as f:
+        return json.load(f)
+
+
+def run_local_composite(image_dir, output_path, mode="auto", duration=6.0, fps=24,
+                        parallax_strength=200, kenburns_zoom=1.1, kenburns_pan=80,
+                        source=None, depth_threshold=0.12, width=None, height=None):
+    """本地运行视差/Ken Burns 合成。"""
+    cmd = [
+        sys.executable,
+        os.path.join(SCRIPT_DIR, "parallax_composite.py"),
+        "--image-dir", image_dir,
+        "-o", output_path,
+        "--mode", mode,
+        "--duration", str(duration),
+        "--fps", str(fps),
+        "--parallax-strength", str(parallax_strength),
+        "--kenburns-zoom", str(kenburns_zoom),
+        "--kenburns-pan", str(kenburns_pan),
+        "--depth-threshold", str(depth_threshold),
+    ]
+    if source:
+        cmd.extend(["--source", source])
+    if width and height:
+        cmd.extend(["--width", str(width), "--height", str(height)])
+
+    print(f"Running parallax composite ({mode} mode)...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Composite failed:\n{result.stderr}")
+        return None
+    print(result.stdout)
+
+    if os.path.exists(output_path):
+        return output_path
+    print("ERROR: output video not created")
     return None
 
 
-def run_remote_render(layers, preset_name, camera="scroll_left", duration=6.0,
-                      resolution=(1080, 1920), output_dir=WIN_OUTPUT_DIR):
-    """在Windows端运行视差场景渲染"""
-    sys.path.insert(0, ENGINE_CLIENT_DIR)
-    from blender_client import BlenderAgentClient
-    from generators.parallax import ParallaxParams, LayerConfig, generate_parallax_script
-
-    cli = BlenderAgentClient(ENGINE_HOST)
-
-    layer_configs = [
-        LayerConfig(name=l["name"], image_path=l["image_path"], z_depth=l["z_depth"])
-        for l in layers
-    ]
-
-    params = ParallaxParams(
-        preset_name=preset_name,
-        layers=layer_configs,
-        camera_preset=camera,
-        duration=duration,
-        resolution=resolution,
-        output_format="video",
-        output_dir=output_dir,
-    )
-
-    script = generate_parallax_script(params)
-    print(f"🎬 Rendering parallax scene...")
-    job_id = cli.run_async(script, timeout=600)
-    status = cli.poll_job(job_id, interval=10, max_wait=600)
-    return status
-
-
 def main():
-    parser = argparse.ArgumentParser(description="2.5D视差场景全流程(Windows端)")
-    parser.add_argument("--image-path", required=True, help="Windows端图片路径")
-    parser.add_argument("--image-url", default=None, help="图片URL(自动下载到Windows)")
+    parser = argparse.ArgumentParser(description="2.5D视差场景全流程（本地执行）")
+    parser.add_argument("--image-path", required=True, help="输入图片路径")
     parser.add_argument("-n", "--name", default="parallax_scene", help="输出文件名前缀")
-    parser.add_argument("-o", "--output", default=WIN_OUTPUT_DIR, help="Windows端输出目录")
+    parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="输出根目录")
     parser.add_argument("-l", "--layers", type=int, default=3, choices=[2, 3, 4])
+    parser.add_argument("--sigma", type=float, default=3.0, help="边缘羽化半径")
     parser.add_argument("--camera", default="scroll_left",
                         choices=["scroll_left", "scroll_right", "push_in", "dolly_zoom", "orbit", "static"])
     parser.add_argument("--duration", type=float, default=6.0)
+    parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--ratio", default="9:16", choices=["9:16", "16:9", "1:1"])
-    parser.add_argument("--engine-host", default=ENGINE_HOST)
+    parser.add_argument("--mode", default="auto", choices=["auto", "parallax", "kenburns"])
+    parser.add_argument("--parallax-strength", type=int, default=200, help="视差偏移强度(px)")
+    parser.add_argument("--kenburns-zoom", type=float, default=1.1, help="Ken Burns缩放倍率")
+    parser.add_argument("--kenburns-pan", type=int, default=80, help="Ken Burns平移范围(px)")
+    parser.add_argument("--source", default=None, help="Ken Burns用完整原图路径")
+    parser.add_argument("--depth-threshold", type=float, default=0.12, help="自动模式景深方差阈值")
     args = parser.parse_args()
 
-    image_path = args.image_path
-    output_dir = os.path.join(args.output, args.name)
-
-    # Step 1: 深度分层 (Windows GPU)
-    layers = run_remote_segment(image_path, output_dir, args.layers)
-    if not layers:
+    image_path = os.path.abspath(args.image_path)
+    if not os.path.exists(image_path):
+        print(f"ERROR: 文件不存在: {image_path}")
         sys.exit(1)
 
-    # Step 2: 视差渲染 (Windows GPU)
+    output_dir = os.path.join(args.output, args.name)
+    segments_dir = os.path.join(output_dir, "segments")
+    video_path = os.path.join(output_dir, f"{args.name}.mp4")
+
     resolution = {
         "9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)
     }[args.ratio]
 
-    status = run_remote_render(
-        layers, args.name,
-        camera=args.camera, duration=args.duration,
-        resolution=resolution, output_dir=output_dir,
+    # Step 1: 深度分层 (本地 GPU)
+    print(f"\n=== Step 1: Depth Segmentation ===")
+    print(f"  Image: {image_path}")
+    print(f"  Output: {segments_dir}")
+    print(f"  Layers: {args.layers}")
+
+    layer_config = run_local_segment(image_path, segments_dir, args.layers, args.sigma)
+    if not layer_config:
+        sys.exit(1)
+    print(f"  Segmented into {len(layer_config)} layers")
+
+    # Step 2: 视差合成 (本地)
+    print(f"\n=== Step 2: Parallax Composite ===")
+    print(f"  Mode: {args.mode}")
+    print(f"  Duration: {args.duration}s @ {args.fps}fps")
+
+    video = run_local_composite(
+        segments_dir, video_path,
+        mode=args.mode,
+        duration=args.duration,
+        fps=args.fps,
+        parallax_strength=args.parallax_strength,
+        kenburns_zoom=args.kenburns_zoom,
+        kenburns_pan=args.kenburns_pan,
+        source=args.source,
+        depth_threshold=args.depth_threshold,
+        width=resolution[0],
+        height=resolution[1],
     )
 
-    if status.get("status") == "completed":
-        print(f"\n🎉 完成!")
-        print(f"  📁 {output_dir}")
-        print(f"  🎬 {args.name}.mp4")
-        print(f"  📄 {args.name}.blend")
+    if video:
+        size = os.path.getsize(video)
+        print(f"\nDone!")
+        print(f"  Video: {video} ({size / 1024:.0f}KB)")
+        print(f"  Segments: {segments_dir}")
     else:
-        print(f"\n❌ 渲染失败: {status}")
+        print(f"\nFailed!")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

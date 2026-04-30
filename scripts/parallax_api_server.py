@@ -92,15 +92,18 @@ def _run_segment(job_id: str, req: SubmitRequest):
     import sys
 
     try:
+        if not req.source_image_path:
+            _tasks[job_id] = {"status": "failed", "error": "source_image_path is required for segmentation"}
+            return
+
         output_dir = req.output_dir or f"/tmp/parallax_segments/{job_id}"
         cmd = [
             sys.executable, str(SCRIPT_DIR / "depth_segment.py"),
-            req.source_image_path or "",
+            req.source_image_path,
             "-o", output_dir,
             "-l", str(req.num_layers),
             "--sigma", str(req.edge_sigma),
         ]
-        cmd = [c for c in cmd if c]  # Remove empty args
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
@@ -125,19 +128,22 @@ def _run_generate(job_id: str, req: SubmitRequest):
         segments_dir = f"{output_dir}/segments"
         video_path = f"{output_dir}/output.mp4"
 
-        # Step 1: Depth segmentation
-        cmd = [
-            sys.executable, str(SCRIPT_DIR / "depth_segment.py"),
-            req.source_image_path or "",
-            "-o", segments_dir,
-            "-l", str(req.num_layers),
-            "--sigma", str(req.edge_sigma),
-        ]
-        cmd = [c for c in cmd if c]
+        # Step 1: Depth segmentation (only if source image provided)
+        if req.source_image_path:
+            cmd = [
+                sys.executable, str(SCRIPT_DIR / "depth_segment.py"),
+                req.source_image_path,
+                "-o", segments_dir,
+                "-l", str(req.num_layers),
+                "--sigma", str(req.edge_sigma),
+            ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            _tasks[job_id] = {"status": "failed", "error": f"Segment failed: {result.stderr[-300:]}"}
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                _tasks[job_id] = {"status": "failed", "error": f"Segment failed: {result.stderr[-300:]}"}
+                return
+        else:
+            _tasks[job_id] = {"status": "failed", "error": "source_image_path is required for parallax generation (text-to-video not yet supported)"}
             return
 
         # Step 2: Composite
